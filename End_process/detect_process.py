@@ -17,31 +17,52 @@ parser.add_argument("--size", default=256, help="size of ML processed image")
 
 a = parser.parse_args()
 
-KERNEL = np.ones((5, 5), np.uint8)
+KERNEL_1 = np.ones((5, 5), np.uint8)
+KERNEL_2 = np.ones((5, 5), np.uint8)
+KERNEL_3 = (11, 11)
+
+HIST_RODS = 8
+GRAD_MAX = 50
+GRAD_SCALE = 1.0
 
 
-def rect_points(ori_im, rm_thumb_im):
+def _img_proc(ori_im, rm_thm):
 
-    # convert to gray, removed background image (size: 256 * 256)
-    rm_thumb_gray = cv2.cvtColor(rm_thumb_im, cv2.COLOR_RGB2GRAY)
-    # threshold the gray image with gaussian filtering
-    # rm_bin = cv2.adaptiveThreshold(rm_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-    ret, rm_thumb_bin = cv2.threshold(rm_thumb_gray, 10, 255, cv2.THRESH_BINARY)
-    # soil erosion
-    rm_thumb_bin = cv2.erode(rm_thumb_bin, KERNEL, iterations=1)
-    # dilation, opposite of erosion
-    rm_thumb_bin = cv2.dilate(rm_thumb_bin, KERNEL, iterations=1)
+    """ Extract the mask image for car with the original image size """
+    rm_thm_gray = cv2.cvtColor(rm_thm, cv2.COLOR_RGB2GRAY)
+    _, rm_thm_bin = cv2.threshold(rm_thm_gray, 10, 255, cv2.THRESH_BINARY)
+    # soil erosion and dilation, opposite of erosion
+    rm_thm_bin = cv2.erode(rm_thm_bin, KERNEL_1, iterations=1)
+    rm_thm_bin = cv2.dilate(rm_thm_bin, KERNEL_1, iterations=1)
 
     # resizing to fit the original size
-    h, w, chs = ori_im.shape
+    ori_h, ori_w, chs = ori_im.shape
 
-    th_h, th_w = rm_thumb_bin.shape[:2]
+    th_h, th_w = rm_thm_bin.shape[:2]
 
-    M = np.float32([[float(w) / th_w, 0, 0], [0, float(w) / th_w, int((h - float(th_h * w) / th_w) / 2)]])
-    mask = cv2.warpAffine(rm_thumb_bin, M, (w, h))
+    M = np.float32(
+        [[float(ori_w) / th_w, 0, 0], [0, float(ori_w) / th_w, int((ori_h - float(th_h * ori_w) / th_w) / 2)]])
+    obj_mask = cv2.warpAffine(rm_thm_bin, M, (ori_w, ori_h))
 
+    # obj_mask = cv2.erode(obj_mask, KERNEL_2, iterations=1)
+    obj_mask = cv2.GaussianBlur(obj_mask, KERNEL_3, 5.0)
+    obj_mask = cv2.threshold(obj_mask, 170, 255, cv2.THRESH_BINARY)[1]
+
+    """ Color Recognition with historgram analysis """
+    # color detection
+    hist_b = cv2.calcHist([ori_im], [0], obj_mask, [HIST_RODS], [0, 256])
+    hist_g = cv2.calcHist([ori_im], [1], obj_mask, [HIST_RODS], [0, 256])
+    hist_r = cv2.calcHist([ori_im], [2], obj_mask, [HIST_RODS], [0, 256])
+
+    b = np.argmax(hist_b) * 255 / HIST_RODS + 0.5 * 255 / HIST_RODS
+    g = np.argmax(hist_g) * 255 / HIST_RODS + 0.5 * 255 / HIST_RODS
+    r = np.argmax(hist_r) * 255 / HIST_RODS + 0.5 * 255 / HIST_RODS
+
+    color = (int(r), int(g), int(b))
+
+    """ Extract the rect of object from the Contours """
     # get contour from mask image
-    im, contours, hierarchy = cv2.findContours(mask.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    _, contours, hierarchy = cv2.findContours(obj_mask.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
 
     # merging contours
     rect = []
@@ -52,50 +73,71 @@ def rect_points(ori_im, rm_thumb_im):
     pick = non_max_suppression(rect, probs=None, overlapThresh=0.65)
 
     max_square = 0.0
-    res_rect = []
+    rect = []
     for (x1, y1, x2, y2) in pick:
         square = math.fabs((x1 - x2) * (y1 - y2))
 
-
-
         if max_square < square:
             max_square = square
-            res_rect = [(x1, y1), (x2, y2)]
+            rect = [(x1, y1), (x2, y2)]
 
-    # cv2.rectangle(ori_im, res_rect[0], res_rect[1], (0, 0, 255))
-
+    """ Combind the extracted object and the gradiented background """
     # removed background image with the same size of original image
-    rm_bk_im = np.zeros(ori_im.shape)
+    rm_im = np.zeros((ori_h, ori_w, 4), dtype=np.uint8)
+
+    bk_mask = np.ones((ori_h, ori_w), dtype=np.float)
+    for i in range(ori_h):
+        bk_mask[i, :] = bk_mask[i, :] * GRAD_MAX * (ori_h / 2 - i) / (ori_h / 2)
+
+    # bluring the background image with gradiental filter size
+    blur_im = ori_im.copy()
+    kernels = KERNEL_3[0]
+    if not kernels % 2 == 1:
+        kernels += 1
+    for ker_sz in range(0, kernels, 2):
+        top = max(int(ker_sz * ori_h / kernels), 0)
+        bottom = min(int((ker_sz + 2) * ori_h / kernels), ori_h)
+        blur_im[top:bottom, :] = cv2.GaussianBlur(ori_im[top:bottom, :], (kernels-ker_sz, kernels-ker_sz), 0)
+
+    # combine the blured background and cropped object image
     for ch in range(chs):
-        rm_bk_im[:, :, ch] = ori_im[:, :, ch] * (1.0 - (mask[:, :] / 255.0))
+        rm_im[:, :, ch] = ori_im[:, :, ch] * (obj_mask[:, :] / 255.0)
+        blur_im[:, :, ch] = blur_im[:, :, ch] * (1 - obj_mask[:, :] / 255.0) + \
+                               rm_im[:, :, ch] * (obj_mask[:, :] / 255.0)
+    rm_im[:, :, 3] = obj_mask  # alpha channel for .png file
 
-    return res_rect, rm_bk_im
+    # adjust the brightness with lightness(from top to center) and darkeness(from center to bottom)
+    hsv_im = cv2.cvtColor(blur_im, cv2.COLOR_BGR2HSV)
+    hsv_im[:, :, 2] = np.where((hsv_im[:, :, 2] + bk_mask[:, :] * GRAD_SCALE) > 255, 255,
+                               (np.where((hsv_im[:, :, 2] + bk_mask[:, :] * GRAD_SCALE) < 0, 0,
+                                         hsv_im[:, :, 2] + bk_mask[:, :] * GRAD_SCALE)))
+    blur_im = cv2.cvtColor(hsv_im, cv2.COLOR_HSV2BGR)
+
+    rm_im = rm_im.astype(np.uint8)
+    blur_im = blur_im.astype(np.uint8)
+
+    return rect, color, rm_im, blur_im
 
 
-def color_detect(rm_thumb):
-
-    col = (0, 0, 0)
-    return col
-
-
-def text_detect(ori):
+def _text_proc(ori_im):
 
     text = ""
     return text
 
 
-def end_process(ori_im, rm_thumb_im):
+def _proc(ori_im, rm_thm):
 
     res_dict = {}
-    rect, rm_im = rect_points(ori_im, rm_thumb_im)
-    color = color_detect(rm_thumb_im)
-    text = text_detect(ori_im)
+
+    # detect info from image
+    rect, color, obj_im, feather_im = _img_proc(ori_im, rm_thm)
+    text = _text_proc(ori_im)
 
     res_dict["rect_points"] = rect
     res_dict["color"] = color
     res_dict["text"] = text
 
-    return res_dict
+    return res_dict, obj_im, feather_im
 
 
 def scan_folder(ori_dir, out_dir):
@@ -111,16 +153,27 @@ def scan_folder(ori_dir, out_dir):
         if ext.lower() == '.jpg':
 
             rm_fn = fn + '-outputs.png'
-            rm_path = os.path.join(out_dir, rm_fn)  # file path of removed backgroud and cropped
+            rm_thum_path = os.path.join(out_dir, rm_fn)  # file path of removed backgroud and cropped
 
-            if os.path.isfile(rm_path):
+            rm_obj_fn = fn + '-car.png'
+            rm_obj_path = os.path.join(ori_dir, rm_obj_fn)  # file path of removed backgroud and cropped
+
+            rm_out_fn = fn + '-gradient.png'
+            rm_out_path = os.path.join(ori_dir, rm_out_fn)  # file path of removed backgroud and cropped
+
+            if os.path.isfile(rm_thum_path):
                 sys.stdout.write("%d / %d, File Name: %s\n" % (cnt, total, f))
+                # print("%d / %d, File Name: %s\n" % (cnt, total, f))
                 cnt += 1
 
                 ori_path = os.path.join(ori_dir, f)
                 ori_img = cv2.imread(ori_path)
-                rm_thumb_img = cv2.imread(rm_path, -1)
-                result_dict = end_process(ori_img, rm_thumb_img)
+                rm_thumb_img = cv2.imread(rm_thum_path, -1)
+
+                result_dict, obj_img, out_img = _proc(ori_img, rm_thumb_img)
+
+                cv2.imwrite(rm_obj_path, obj_img)
+                cv2.imwrite(rm_out_path, out_img)
 
                 print(result_dict["rect_points"])
                 print(result_dict["color"])
